@@ -77,7 +77,6 @@ def train(args):
         ssd_classification_losses = []
         ssd_localization_losses = []
         for idx, (ims, targets, _) in enumerate(tqdm(train_dataset)):
-            optimizer.zero_grad()
             for target in targets:
                 target['boxes'] = target['bboxes'].float().to(device)
                 del target['bboxes']
