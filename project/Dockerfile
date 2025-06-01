@@ -8,5 +8,5 @@ COPY .. /app
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Domyślna komenda
-CMD ["python3", "-m", "tools.train"]
-#CMD ["/bin/bash"]
+#CMD ["python3", "-m", "tools.train"]
+CMD ["python3", "-m", "tools.infer", "--evaluate", "True", "--infer_samples", "False"]

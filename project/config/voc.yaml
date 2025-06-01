@@ -32,4 +32,4 @@ train_params:
   lr: 0.001
   log_steps : 100
   infer_conf_threshold : 0.5
-  ckpt_name: 'ssd_voc2007.pth'
+  ckpt_name: 'ssd_voc2007.pth.pt'
