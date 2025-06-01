@@ -190,9 +190,22 @@ def load_model_and_dataset(args):
                                        train_config['ckpt_name'])), \
         "No checkpoint exists at {}".format(os.path.join(train_config['task_name'],
                                                          train_config['ckpt_name']))
-    model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
-                                                       train_config['ckpt_name']),
-                                     map_location=device))
+
+    checkpoint = torch.load(os.path.join(train_config['task_name'],
+                                          train_config['ckpt_name']),
+                           map_location=device)
+
+    # Check if checkpoint is a dictionary with epoch information
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        # Extract epoch information
+        epoch = checkpoint.get('epoch', None)
+        if epoch is not None:
+            print(f"Model trained for {epoch + 1} epochs")
+    else:
+        # Fall back to old format where the checkpoint is just the state_dict
+        model.load_state_dict(checkpoint)
+
     return model, voc, test_dataset, config
 
 

@@ -113,7 +113,7 @@ def train(args):
         print(loss_output)
 
         save_path = os.path.join(train_config['task_name'],
-                                 f"{train_config['ckpt_name']}_epoch_{i}.pt")
+                                 f"{train_config['ckpt_name']}.pt")
 
         checkpoint = {
             'epoch': i,

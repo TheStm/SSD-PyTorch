@@ -4,6 +4,6 @@ services:
   pytorch-training:
     build: .
     volumes:
-      - ../data:/data
+      - ../data:/app/data
       - ../checkpoints:/app/voc
     runtime: nvidia
