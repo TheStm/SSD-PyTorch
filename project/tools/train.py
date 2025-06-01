@@ -8,6 +8,7 @@ from tqdm import tqdm
 from model.ssd import SSD
 import torchvision
 from dataset.voc import VOCDataset
+from dataset.coco import COCODataset
 from torch.utils.data.dataloader import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 
@@ -42,38 +43,63 @@ def train(args):
     if device == 'cuda':
         torch.cuda.manual_seed_all(seed)
 
-    voc = VOCDataset('train',
-                     im_sets=dataset_config['train_im_sets'],
-                     im_size=dataset_config['im_size'])
-    train_dataset = DataLoader(voc,
-                               batch_size=train_config['batch_size'],
-                               shuffle=True,
-                               collate_fn=collate_function)
+    # Determine which dataset to use based on config file
+    dataset_type = 'voc'  # Default
+    if args.config_path.endswith('coco.yaml'):
+        dataset_type = 'coco'
+
+    print(f"Using {dataset_type.upper()} dataset")
+
+    # Create the appropriate dataset based on type
+    if dataset_type == 'voc':
+        train_dataset_obj = VOCDataset('train',
+                              im_sets=dataset_config['train_im_sets'],
+                              im_size=dataset_config['im_size'])
+    else:  # COCO
+        train_dataset_obj = COCODataset('train',
+                               coco_root=dataset_config['coco_root'],
+                               im_size=dataset_config['im_size'])
+
+    train_dataset = DataLoader(train_dataset_obj,
+                           batch_size=train_config['batch_size'],
+                           shuffle=True,
+                           collate_fn=collate_function)
 
     # Instantiate model and load checkpoint if present
     model = SSD(config=config['model_params'],
                 num_classes=dataset_config['num_classes'])
     model.to(device)
     model.train()
-    # if os.path.exists(os.path.join(train_config['task_name'],
-    #                                train_config['ckpt_name'])):
-        # print('Loading checkpoint as one exists')
-        # model.load_state_dict(torch.load(
-        #     os.path.join(train_config['task_name'],
-        #                  train_config['ckpt_name']),
-        #     map_location=device))
+
+    checkpoint_path = os.path.join(train_config['task_name'], f"{train_config['ckpt_name']}.pt")
+    if os.path.exists(checkpoint_path):
+        print(f'Loading checkpoint: {checkpoint_path}')
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Resuming from epoch {checkpoint['epoch']+1}")
+        start_epoch = checkpoint['epoch'] + 1
+    else:
+        start_epoch = 0
 
     if not os.path.exists(train_config['task_name']):
-        os.mkdir(train_config['task_name'])
+        os.makedirs(train_config['task_name'], exist_ok=True)
 
     optimizer = torch.optim.SGD(lr=train_config['lr'],
                                 params=model.parameters(),
                                 weight_decay=5E-4, momentum=0.9)
+    if start_epoch > 0 and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
     lr_scheduler = MultiStepLR(optimizer, milestones=train_config['lr_steps'], gamma=0.5)
+
+    # Skip epochs that have already been trained
+    for _ in range(start_epoch):
+        lr_scheduler.step()
+
     acc_steps = train_config['acc_steps']
     num_epochs = train_config['num_epochs']
     steps = 0
-    for i in range(num_epochs):
+    for i in range(start_epoch, num_epochs):
         ssd_classification_losses = []
         ssd_localization_losses = []
         for idx, (ims, targets, _) in enumerate(tqdm(train_dataset)):
@@ -132,3 +158,4 @@ if __name__ == '__main__':
                         default='config/voc.yaml', type=str)
     args = parser.parse_args()
     train(args)
+
