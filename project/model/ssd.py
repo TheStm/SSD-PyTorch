@@ -2,6 +2,7 @@ import torch.nn as nn
 import torch
 import math
 import torchvision
+from torchvision.models.resnet import ResNet50_Weights
 
 
 def get_iou(boxes1, boxes2):
@@ -85,7 +86,7 @@ def apply_regression_pred_to_default_boxes(box_transform_pred,
     :return: pred_boxes: (Tensor of shape N x 4)
     """
 
-    # Get cx, cy, w, h from x1,y1,x2,y2
+    # Get cx, cy, w, h from x1,y1,x2y2
     w = default_boxes[:, 2] - default_boxes[:, 0]
     h = default_boxes[:, 3] - default_boxes[:, 1]
     center_x = default_boxes[:, 0] + 0.5 * w
@@ -204,22 +205,19 @@ class SSD(nn.Module):
     Main Class for SSD. Does the following steps
     to generate detections/losses.
     During initialization
-    1. Load VGG Imagenet pretrained model
-    2. Extract Backbone from VGG and add extra conv layers
+    1. Load ResNet50 Imagenet pretrained model
+    2. Extract Backbone from ResNet50 and add extra conv layers
     3. Add class prediction and bbox transformation prediction layers
     4. Initialize all conv2d layers
 
     During Forward Pass
-    1. Get conv4_3 output
-    2. Normalize and scale conv4_3 output (feat_output_1)
-    3. Pass the unscaled conv4_3 to conv5_3 layers and conv layers
-        replacing fc6 and fc7 of vgg (feat_output_2)
-    4. Pass the conv_fc7 output to extra conv layers (feat_output_3-6)
-    5. Get the classification and regression predictions for all 6 feature maps
-    6. Generate default_boxes for all these feature maps(8732 x 4)
-    7a. If in training assign targets for these default_boxes and
+    1. Get feature maps from ResNet50's different stages
+    2. Pass additional conv layers to generate more feature maps
+    3. Get the classification and regression predictions for all feature maps
+    4. Generate default_boxes for all these feature maps
+    5a. If in training assign targets for these default_boxes and
         compute localization and classification losses
-    7b. If in inference mode, then do all pre-nms filtering, nms
+    5b. If in inference mode, then do all pre-nms filtering, nms
         and then post nms filtering and return the detected boxes,
         their labels and their scores
     """
@@ -238,82 +236,76 @@ class SSD(nn.Module):
         self.nms_threshold = config['nms_threshold']
         self.detections_per_img = config['detections_per_img']
 
-        # Load imagenet pretrained vgg network
-        backbone = torchvision.models.vgg16(
-            weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1
+        # Load imagenet pretrained ResNet50 network
+        backbone = torchvision.models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+
+        # Extract layers from ResNet50 but modify to get the right feature map sizes
+
+        # Input size: 300x300
+
+        # Layer 0: conv1 without maxpool to preserve resolution
+        # Output size: 150x150 (after stride 2 in conv1)
+        self.layer0 = nn.Sequential(
+            backbone.conv1,  # 7x7 conv, stride 2
+            backbone.bn1,
+            backbone.relu
         )
 
-        # Get all max pool indexes to determine different stages
-        max_pool_pos = [idx for idx, layer in enumerate(list(backbone.features))
-                        if isinstance(layer, nn.MaxPool2d)]
-        max_pool_stage_3_pos = max_pool_pos[-3]  # for vgg16 this would be 16
-        max_pool_stage_4_pos = max_pool_pos[-2]  # for vgg16 this would be 23
-
-        backbone.features[max_pool_stage_3_pos].ceil_mode = True
-        # otherwise vgg conv4_3 output will be 37x37
-        self.features = nn.Sequential(*backbone.features[:max_pool_stage_4_pos])
-        self.scale_weight = nn.Parameter(torch.ones(512) * 20)
-
-        ###################################
-        # Conv5_3 + Conv for fc6 and fc 7 #
-        ###################################
-        # Conv modules replacing fc6 and fc7
-        # Ideally we would copy the weights
-        # but here we are just adding new layers
-        # and not copying fc6 and fc7 weights by
-        # subsampling
-        fcs = nn.Sequential(
-            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
-            nn.Conv2d(in_channels=512, out_channels=1024, kernel_size=3,
-                      padding=6, dilation=6),
+        # Layer 1: custom layer to get 38x38 feature map (feature map 1)
+        # Output size: 38x38
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, stride=4, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=1),
-            nn.ReLU(inplace=True),
-        )
-        self.conv5_3_fc = nn.Sequential(
-            *backbone.features[max_pool_stage_4_pos:-1],
-            fcs,
+            backbone.layer1  # This maintains channel count at 256
         )
 
-        ##########################
-        # Additional Conv Layers #
-        ##########################
-        # Modules to take from 19x19 to 10x10
+        # Feature map 1 (38x38x256) - L2 normalization and scaling
+        self.feature_map1_scale = nn.Parameter(torch.ones(256) * 20)
+
+        # Layer 2: to get 19x19 feature map (feature map 2)
+        # Output size: 19x19
+        self.layer2 = nn.Sequential(
+            backbone.layer2,  # This increases channels to 512
+            nn.Conv2d(512, 512, kernel_size=1)  # 1x1 conv to maintain size
+        )
+
+        # Additional convolutional layers to create remaining feature maps
+
+        # Feature map 3: 10x10x512
         self.conv8_2 = nn.Sequential(
-            nn.Conv2d(1024, 256, kernel_size=1),
+            nn.Conv2d(512, 256, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1,
-                      stride=2),
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True)
         )
 
-        # Modules to take from 10x10 to 5x5
+        # Feature map 4: 5x5x256
         self.conv9_2 = nn.Sequential(
             nn.Conv2d(512, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1,
-                      stride=2),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True)
         )
 
-        # Modules to take from 5x5 to 3x3
+        # Feature map 5: 3x3x256
         self.conv10_2 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True)
         )
 
-        # Modules to take from 3x3 to 1x1
+        # Feature map 6: 1x1x256
         self.conv11_2 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3),
+            nn.Conv2d(128, 256, kernel_size=3, stride=3), # No padding to go from 3x3 to 1x1
             nn.ReLU(inplace=True)
         )
 
-        # Must match conv4_3, fcs, conv8_2, conv9_2, conv10_2, conv11_2
-        out_channels = [512, 1024, 512, 256, 256, 256]
+        # Output channels for each feature map
+        out_channels = [256, 512, 512, 256, 256, 256]
 
         #####################
         # Prediction Layers #
@@ -336,12 +328,6 @@ class SSD(nn.Module):
         #############################
         # Conv Layer Initialization #
         #############################
-        for layer in fcs.modules():
-            if isinstance(layer, nn.Conv2d):
-                torch.nn.init.xavier_uniform_(layer.weight)
-                if layer.bias is not None:
-                    torch.nn.init.constant_(layer.bias, 0.0)
-
         for conv_module in [self.conv8_2, self.conv9_2, self.conv10_2, self.conv11_2]:
             for layer in conv_module.modules():
                 if isinstance(layer, nn.Conv2d):
@@ -453,29 +439,31 @@ class SSD(nn.Module):
         }
 
     def forward(self, x, targets=None):
-        # Call everything till conv4_3 layers first
-        conv_4_3_out = self.features(x)
+        # Forward pass through modified ResNet50 layers to get standard SSD feature maps
+        x = self.layer0(x)  # 150x150x64
 
-        # Scale conv4_3 output using learnt norm scale
-        conv_4_3_out_scaled = (self.scale_weight.view(1, -1, 1, 1) *
-                               torch.nn.functional.normalize(conv_4_3_out))
+        # Feature map 1: 38x38x256
+        feature_map1 = self.layer1(x)  # 38x38x256
+        feature_map1_scaled = (self.feature_map1_scale.view(1, -1, 1, 1) *
+                              torch.nn.functional.normalize(feature_map1))
 
-        # Call conv5_3 with non_scaled conv_3 and also
-        # Call additional conv layers
-        conv_5_3_fc_out = self.conv5_3_fc(conv_4_3_out)
-        conv8_2_out = self.conv8_2(conv_5_3_fc_out)
-        conv9_2_out = self.conv9_2(conv8_2_out)
-        conv10_2_out = self.conv10_2(conv9_2_out)
-        conv11_2_out = self.conv11_2(conv10_2_out)
+        # Feature map 2: 19x19x512
+        feature_map2 = self.layer2(feature_map1)  # 19x19x512
+
+        # Additional feature maps
+        feature_map3 = self.conv8_2(feature_map2)     # 10x10x512
+        feature_map4 = self.conv9_2(feature_map3)     # 5x5x256
+        feature_map5 = self.conv10_2(feature_map4)    # 3x3x256
+        feature_map6 = self.conv11_2(feature_map5)    # 1x1x256
 
         # Feature maps for predictions
         outputs = [
-            conv_4_3_out_scaled,  # 38 x 38
-            conv_5_3_fc_out,  # 19 x 19
-            conv8_2_out,  # 10 x 10
-            conv9_2_out,  # 5 x 5
-            conv10_2_out,  # 3 x 3
-            conv11_2_out,   # 1 x 1
+            feature_map1_scaled,  # 38x38x256
+            feature_map2,         # 19x19x512
+            feature_map3,         # 10x10x512
+            feature_map4,         # 5x5x256
+            feature_map5,         # 3x3x256
+            feature_map6,         # 1x1x256
         ]
 
         # Classification and bbox regression for all feature maps
@@ -602,23 +590,25 @@ class SSD(nn.Module):
                 keep_mask = torch.zeros_like(pred_scores, dtype=torch.bool)
                 for class_id in torch.unique(pred_labels):
                     curr_indices = torch.where(pred_labels == class_id)[0]
-                    curr_keep_idxs = torch.ops.torchvision.nms(pred_boxes[curr_indices],
-                                                               pred_scores[curr_indices],
-                                                               self.nms_threshold)
-                    keep_mask[curr_indices[curr_keep_idxs]] = True
-                keep_indices = torch.where(keep_mask)[0]
-                post_nms_keep_indices = keep_indices[pred_scores[keep_indices].sort(
-                    descending=True)[1]]
-                keep = post_nms_keep_indices[:self.detections_per_img]
-                pred_boxes, pred_scores, pred_labels = (pred_boxes[keep],
-                                                        pred_scores[keep],
-                                                        pred_labels[keep])
+                    curr_class_scores = pred_scores[curr_indices]
+                    curr_class_boxes = pred_boxes[curr_indices]
 
+                    # Apply NMS
+                    # Return indices that need to be kept
+                    keep_indices = torchvision.ops.nms(
+                        curr_class_boxes, curr_class_scores, self.nms_threshold
+                    )
+                    keep_mask[curr_indices[keep_indices]] = True
+
+                # Filter scores, boxes, and labels
+                keep_indices = torch.where(keep_mask)[0]
+                if keep_indices.shape[0] > self.detections_per_img:
+                    keep_indices = keep_indices[: self.detections_per_img]
                 detections.append(
                     {
-                        "boxes": pred_boxes,
-                        "scores": pred_scores,
-                        "labels": pred_labels,
+                        "boxes": pred_boxes[keep_indices],
+                        "scores": pred_scores[keep_indices],
+                        "labels": pred_labels[keep_indices],
                     }
                 )
         return losses, detections
