@@ -261,7 +261,8 @@ class SSD(nn.Module):
         )
 
         # Feature map 1 (38x38x256) - L2 normalization and scaling
-        self.feature_map1_scale = nn.Parameter(torch.ones(256) * 20)
+        # Initialize with a more moderate value (10 instead of 20)
+        self.feature_map1_scale = nn.Parameter(torch.ones(256) * 10)
 
         # Layer 2: to get 19x19 feature map (feature map 2)
         # Output size: 19x19
